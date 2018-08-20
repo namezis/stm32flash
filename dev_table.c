@@ -50,6 +50,9 @@ static uint32_t f4db[]  = {
 /* F7 page size */
 static uint32_t f7[]    = { SZ_32K, SZ_32K, SZ_32K, SZ_32K, SZ_128K, SZ_256K, 0 };
 
+/* H7 page size */
+static uint32_t h7[]    = { SZ_128K, SZ_128K, SZ_128K, SZ_128K, SZ_128K, SZ_128K, SZ_128K, SZ_128K, 0 };
+
 /*
  * Device table, corresponds to the "Bootloader device-dependant parameters"
  * table in ST document AN2606.
@@ -90,6 +93,9 @@ const stm32_dev_t devices[] = {
 	{0x434, "STM32F469xx"                     , 0x20003000, 0x20060000, 0x08000000, 0x08200000,  1, f4db  , 0x1FFEC000, 0x1FFFC00F, 0x1FFF0000, 0x1FFF7800, 0},
 	/* F7 */
 	{0x449, "STM32F74xxx/75xxx"               , 0x20004000, 0x20050000, 0x08000000, 0x08100000,  1, f7    , 0x1FFF0000, 0x1FFF001F, 0x1FF00000, 0x1FF0EDC0, 0},
+	/* H7 */
+	//                                         // To Do: FIX H7 Memory mapping
+	{0x450, "STM32H74xxx/75xxx"               , 0x20004000, 0x20084000, 0x08000000, 0x08100000,  1, h7    , 0x1FFF0000, 0x1FFF001F, 0x1FF00000, 0x1FF0EDC0, 0},
 	/* L0 */
 	{0x425, "STM32L031xx/041xx"               , 0x20001000, 0x20002000, 0x08000000, 0x08008000, 32, p_128 , 0x1FF80000, 0x1FF8001F, 0x1FF00000, 0x1FF01000, 0},
 	{0x417, "STM32L05xxx/06xxx"               , 0x20001000, 0x20002000, 0x08000000, 0x08010000, 32, p_128 , 0x1FF80000, 0x1FF8001F, 0x1FF00000, 0x1FF01000, 0},
