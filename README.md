@@ -1,9 +1,9 @@
 stm32flash
 ==========
 
-**[2018-08] update to version 0.5, build for windows only using MingW and VisualGDB
+**[2018-08] update to version 0.5, build for windows only using MingW and VisualGDB**
 
-**[2015-12] upstream moved to: http://sourceforge.net/p/stm32flash/code/ci/master/tree/ You'll probably want to use that, as this version is outdated.**
+[2015-12] upstream moved to: http://sourceforge.net/p/stm32flash/code/ci/master/tree/ You'll probably want to use that, as this version is outdated.
 
 Open source flash program for the STM32 ARM processors using the ST serial bootloader over UART or I2C
 
