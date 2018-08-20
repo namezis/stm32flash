@@ -57,7 +57,7 @@
 
 #define STM32_RESYNC_TIMEOUT	35	/* seconds */
 #define STM32_MASSERASE_TIMEOUT	35	/* seconds */
-#define STM32_SECTERASE_TIMEOUT	5	/* seconds */
+#define STM32_PAGEERASE_TIMEOUT	5	/* seconds */
 #define STM32_BLKWRITE_TIMEOUT	1	/* seconds */
 #define STM32_WUNPROT_TIMEOUT	1	/* seconds */
 #define STM32_WPROT_TIMEOUT	1	/* seconds */
@@ -95,7 +95,31 @@ static const uint8_t stm_reset_code[] = {
 
 static const uint32_t stm_reset_code_length = sizeof(stm_reset_code);
 
+/* RM0360, Empty check
+ * On STM32F070x6 and STM32F030xC devices only, internal empty check flag is
+ * implemented to allow easy programming of the virgin devices by the boot loader. This flag is
+ * used when BOOT0 pin is defining Main Flash memory as the target boot space. When the
+ * flag is set, the device is considered as empty and System memory (boot loader) is selected
+ * instead of the Main Flash as a boot space to allow user to program the Flash memory.
+ * This flag is updated only during Option bytes loading: it is set when the content of the
+ * address 0x08000 0000 is read as 0xFFFF FFFF, otherwise it is cleared. It means a power
+ * on or setting of OBL_LAUNCH bit in FLASH_CR register is needed to clear this flag after
+ * programming of a virgin device to execute user code after System reset.
+ */
+static const uint8_t stm_obl_launch_code[] = {
+	0x01, 0x49,		// ldr     r1, [pc, #4] ; (<FLASH_CR>)
+	0x02, 0x4A,		// ldr     r2, [pc, #8] ; (<OBL_LAUNCH>)
+	0x0A, 0x60,		// str     r2, [r1, #0]
+	0xfe, 0xe7,		// endless: b endless
+	0x10, 0x20, 0x02, 0x40, // address: FLASH_CR = 40022010
+	0x00, 0x20, 0x00, 0x00  // value: OBL_LAUNCH = 00002000
+};
+
+static const uint32_t stm_obl_launch_code_length = sizeof(stm_obl_launch_code);
+
 extern const stm32_dev_t devices[];
+
+int flash_addr_to_page_ceil(uint32_t addr);
 
 static void stm32_warn_stretching(const char *f)
 {
@@ -540,8 +564,8 @@ stm32_err_t stm32_write_memory(const stm32_t *stm, uint32_t address,
 	}
 
 	/* must be 32bit aligned */
-	if (address & 0x3 || len & 0x3) {
-		fprintf(stderr, "Error: WRITE address and length must be 4 byte aligned\n");
+	if (address & 0x3) {
+		fprintf(stderr, "Error: WRITE address must be 4 byte aligned\n");
 		return STM32_ERR_UNKNOWN;
 	}
 
@@ -604,7 +628,7 @@ stm32_err_t stm32_wunprot_memory(const stm32_t *stm)
 		return STM32_ERR_UNKNOWN;
 
 	s_err = stm32_get_ack_timeout(stm, STM32_WUNPROT_TIMEOUT);
-	if (s_err == STM32_NACK) {
+	if (s_err == STM32_ERR_NACK) {
 		fprintf(stderr, "Error: Failed to WRITE UNPROTECT\n");
 		return STM32_ERR_UNKNOWN;
 	}
@@ -631,7 +655,7 @@ stm32_err_t stm32_wprot_memory(const stm32_t *stm)
 		return STM32_ERR_UNKNOWN;
 
 	s_err = stm32_get_ack_timeout(stm, STM32_WPROT_TIMEOUT);
-	if (s_err == STM32_NACK) {
+	if (s_err == STM32_ERR_NACK) {
 		fprintf(stderr, "Error: Failed to WRITE PROTECT\n");
 		return STM32_ERR_UNKNOWN;
 	}
@@ -658,7 +682,7 @@ stm32_err_t stm32_runprot_memory(const stm32_t *stm)
 		return STM32_ERR_UNKNOWN;
 
 	s_err = stm32_get_ack_timeout(stm, STM32_MASSERASE_TIMEOUT);
-	if (s_err == STM32_NACK) {
+	if (s_err == STM32_ERR_NACK) {
 		fprintf(stderr, "Error: Failed to READOUT UNPROTECT\n");
 		return STM32_ERR_UNKNOWN;
 	}
@@ -685,7 +709,7 @@ stm32_err_t stm32_readprot_memory(const stm32_t *stm)
 		return STM32_ERR_UNKNOWN;
 
 	s_err = stm32_get_ack_timeout(stm, STM32_RPROT_TIMEOUT);
-	if (s_err == STM32_NACK) {
+	if (s_err == STM32_ERR_NACK) {
 		fprintf(stderr, "Error: Failed to READOUT PROTECT\n");
 		return STM32_ERR_UNKNOWN;
 	}
@@ -698,119 +722,68 @@ stm32_err_t stm32_readprot_memory(const stm32_t *stm)
 	return STM32_ERR_OK;
 }
 
-stm32_err_t stm32_erase_memory(const stm32_t *stm, uint8_t spage, uint8_t pages)
+static stm32_err_t stm32_mass_erase(const stm32_t *stm)
+{
+	struct port_interface *port = stm->port;
+	stm32_err_t s_err;
+	uint8_t buf[3];
+
+	if (stm32_send_command(stm, stm->cmd->er) != STM32_ERR_OK) {
+		fprintf(stderr, "Can't initiate chip mass erase!\n");
+		return STM32_ERR_UNKNOWN;
+	}
+
+	/* regular erase (0x43) */
+	if (stm->cmd->er == STM32_CMD_ER) {
+		s_err = stm32_send_command_timeout(stm, 0xFF, STM32_MASSERASE_TIMEOUT);
+		if (s_err != STM32_ERR_OK) {
+			if (port->flags & PORT_STRETCH_W)
+				stm32_warn_stretching("mass erase");
+			return STM32_ERR_UNKNOWN;
+		}
+		return STM32_ERR_OK;
+	}
+
+	/* extended erase */
+	buf[0] = 0xFF;	/* 0xFFFF the magic number for mass erase */
+	buf[1] = 0xFF;
+	buf[2] = 0x00;  /* checksum */
+	if (port->write(port, buf, 3) != PORT_ERR_OK) {
+		fprintf(stderr, "Mass erase error.\n");
+		return STM32_ERR_UNKNOWN;
+	}
+	s_err = stm32_get_ack_timeout(stm, STM32_MASSERASE_TIMEOUT);
+	if (s_err != STM32_ERR_OK) {
+		fprintf(stderr, "Mass erase failed. Try specifying the number of pages to be erased.\n");
+	if (port->flags & PORT_STRETCH_W
+	    && stm->cmd->er != STM32_CMD_EE_NS)
+		stm32_warn_stretching("mass erase");
+		return STM32_ERR_UNKNOWN;
+	}
+	return STM32_ERR_OK;
+}
+
+static stm32_err_t stm32_pages_erase(const stm32_t *stm, uint32_t spage, uint32_t pages)
 {
 	struct port_interface *port = stm->port;
 	stm32_err_t s_err;
 	port_err_t p_err;
-
-	if (!pages)
-		return STM32_ERR_OK;
-
-	if (stm->cmd->er == STM32_CMD_ERR) {
-		fprintf(stderr, "Error: ERASE command not implemented in bootloader.\n");
-		return STM32_ERR_NO_CMD;
-	}
-
-	if (stm32_send_command(stm, stm->cmd->er) != STM32_ERR_OK) {
-		fprintf(stderr, "Can't initiate chip erase!\n");
-		return STM32_ERR_UNKNOWN;
-	}
+	uint32_t pg_num;
+	uint8_t pg_byte;
+	uint8_t cs = 0;
+	uint8_t *buf;
+	int i = 0;
 
 	/* The erase command reported by the bootloader is either 0x43, 0x44 or 0x45 */
 	/* 0x44 is Extended Erase, a 2 byte based protocol and needs to be handled differently. */
 	/* 0x45 is clock no-stretching version of Extended Erase for I2C port. */
-	if (stm->cmd->er != STM32_CMD_ER) {
-		/* Not all chips using Extended Erase support mass erase */
-		/* Currently known as not supporting mass erase is the Ultra Low Power STM32L15xx range */
-		/* So if someone has not overridden the default, but uses one of these chips, take it out of */
-		/* mass erase mode, so it will be done page by page. This maximum might not be correct either! */
-		if (stm->pid == 0x416 && pages == 0xFF)
-			pages = 0xF8; /* works for the STM32L152RB with 128Kb flash */
-
-		if (pages == 0xFF) {
-			uint8_t buf[3];
-
-			/* 0xFFFF the magic number for mass erase */
-			buf[0] = 0xFF;
-			buf[1] = 0xFF;
-			buf[2] = 0x00;	/* checksum */
-			if (port->write(port, buf, 3) != PORT_ERR_OK) {
-				fprintf(stderr, "Mass erase error.\n");
-				return STM32_ERR_UNKNOWN;
-			}
-			s_err = stm32_get_ack_timeout(stm, STM32_MASSERASE_TIMEOUT);
-			if (s_err != STM32_ERR_OK) {
-				fprintf(stderr, "Mass erase failed. Try specifying the number of pages to be erased.\n");
-				if (port->flags & PORT_STRETCH_W
-				    && stm->cmd->er != STM32_CMD_EE_NS)
-					stm32_warn_stretching("erase");
-				return STM32_ERR_UNKNOWN;
-			}
-			return STM32_ERR_OK;
-		}
-
-		uint16_t pg_num;
-		uint8_t pg_byte;
-		uint8_t cs = 0;
-		uint8_t *buf;
-		int i = 0;
-
-		buf = malloc(2 + 2 * pages + 1);
-		if (!buf)
-			return STM32_ERR_UNKNOWN;
-
-		/* Number of pages to be erased - 1, two bytes, MSB first */
-		pg_byte = (pages - 1) >> 8;
-		buf[i++] = pg_byte;
-		cs ^= pg_byte;
-		pg_byte = (pages - 1) & 0xFF;
-		buf[i++] = pg_byte;
-		cs ^= pg_byte;
-
-		for (pg_num = spage; pg_num < spage + pages; pg_num++) {
-			pg_byte = pg_num >> 8;
-			cs ^= pg_byte;
-			buf[i++] = pg_byte;
-			pg_byte = pg_num & 0xFF;
-			cs ^= pg_byte;
-			buf[i++] = pg_byte;
-		}
-		buf[i++] = cs;
-		p_err = port->write(port, buf, i);
-		free(buf);
-		if (p_err != PORT_ERR_OK) {
-			fprintf(stderr, "Page-by-page erase error.\n");
-			return STM32_ERR_UNKNOWN;
-		}
-
-		s_err = stm32_get_ack_timeout(stm, STM32_SECTERASE_TIMEOUT);
-		if (s_err != STM32_ERR_OK) {
-			fprintf(stderr, "Page-by-page erase failed. Check the maximum pages your device supports.\n");
-			if (port->flags & PORT_STRETCH_W
-			    && stm->cmd->er != STM32_CMD_EE_NS)
-				stm32_warn_stretching("erase");
-			return STM32_ERR_UNKNOWN;
-		}
-
-		return STM32_ERR_OK;
+	if (stm32_send_command(stm, stm->cmd->er) != STM32_ERR_OK) {
+		fprintf(stderr, "Can't initiate chip mass erase!\n");
+		return STM32_ERR_UNKNOWN;
 	}
 
-	/* And now the regular erase (0x43) for all other chips */
-	if (pages == 0xFF) {
-		s_err = stm32_send_command_timeout(stm, 0xFF, STM32_MASSERASE_TIMEOUT);
-		if (s_err != STM32_ERR_OK) {
-			if (port->flags & PORT_STRETCH_W)
-				stm32_warn_stretching("erase");
-			return STM32_ERR_UNKNOWN;
-		}
-		return STM32_ERR_OK;
-	} else {
-		uint8_t cs = 0;
-		uint8_t pg_num;
-		uint8_t *buf;
-		int i = 0;
-
+	/* regular erase (0x43) */
+	if (stm->cmd->er == STM32_CMD_ER) {
 		buf = malloc(1 + pages + 1);
 		if (!buf)
 			return STM32_ERR_UNKNOWN;
@@ -828,7 +801,7 @@ stm32_err_t stm32_erase_memory(const stm32_t *stm, uint8_t spage, uint8_t pages)
 			fprintf(stderr, "Erase failed.\n");
 			return STM32_ERR_UNKNOWN;
 		}
-		s_err = stm32_get_ack_timeout(stm, STM32_MASSERASE_TIMEOUT);
+		s_err = stm32_get_ack_timeout(stm, pages * STM32_PAGEERASE_TIMEOUT);
 		if (s_err != STM32_ERR_OK) {
 			if (port->flags & PORT_STRETCH_W)
 				stm32_warn_stretching("erase");
@@ -836,6 +809,92 @@ stm32_err_t stm32_erase_memory(const stm32_t *stm, uint8_t spage, uint8_t pages)
 		}
 		return STM32_ERR_OK;
 	}
+
+	/* extended erase */
+	buf = malloc(2 + 2 * pages + 1);
+	if (!buf)
+		return STM32_ERR_UNKNOWN;
+
+	/* Number of pages to be erased - 1, two bytes, MSB first */
+	pg_byte = (pages - 1) >> 8;
+	buf[i++] = pg_byte;
+	cs ^= pg_byte;
+	pg_byte = (pages - 1) & 0xFF;
+	buf[i++] = pg_byte;
+	cs ^= pg_byte;
+
+	for (pg_num = spage; pg_num < spage + pages; pg_num++) {
+		pg_byte = pg_num >> 8;
+		cs ^= pg_byte;
+		buf[i++] = pg_byte;
+		pg_byte = pg_num & 0xFF;
+		cs ^= pg_byte;
+		buf[i++] = pg_byte;
+	}
+	buf[i++] = cs;
+	p_err = port->write(port, buf, i);
+	free(buf);
+	if (p_err != PORT_ERR_OK) {
+		fprintf(stderr, "Page-by-page erase error.\n");
+		return STM32_ERR_UNKNOWN;
+	}
+
+	s_err = stm32_get_ack_timeout(stm, pages * STM32_PAGEERASE_TIMEOUT);
+	if (s_err != STM32_ERR_OK) {
+		fprintf(stderr, "Page-by-page erase failed. Check the maximum pages your device supports.\n");
+		if (port->flags & PORT_STRETCH_W
+		    && stm->cmd->er != STM32_CMD_EE_NS)
+			stm32_warn_stretching("erase");
+		return STM32_ERR_UNKNOWN;
+	}
+
+	return STM32_ERR_OK;
+}
+
+stm32_err_t stm32_erase_memory(const stm32_t *stm, uint32_t spage, uint32_t pages)
+{
+	uint32_t n;
+	stm32_err_t s_err;
+
+	if (!pages || spage > STM32_MAX_PAGES ||
+	    ((pages != STM32_MASS_ERASE) && ((spage + pages) > STM32_MAX_PAGES)))
+		return STM32_ERR_OK;
+
+	if (stm->cmd->er == STM32_CMD_ERR) {
+		fprintf(stderr, "Error: ERASE command not implemented in bootloader.\n");
+		return STM32_ERR_NO_CMD;
+	}
+
+	if (pages == STM32_MASS_ERASE) {
+		/*
+		 * Not all chips support mass erase.
+		 * Mass erase can be obtained executing a "readout protect"
+		 * followed by "readout un-protect". This method is not
+		 * suggested because can hang the target if a debug SWD/JTAG
+		 * is connected. When the target enters in "readout
+		 * protection" mode it will consider the debug connection as
+		 * a tentative of intrusion and will hang.
+		 * Erasing the flash page-by-page is the safer way to go.
+		 */
+		if (!(stm->dev->flags & F_NO_ME))
+			return stm32_mass_erase(stm);
+
+		pages = flash_addr_to_page_ceil(stm->dev->fl_end);
+	}
+
+	/*
+	 * Some device, like STM32L152, cannot erase more than 512 pages in
+	 * one command. Split the call.
+	 */
+	while (pages) {
+		n = (pages <= 512) ? pages : 512;
+		s_err = stm32_pages_erase(stm, spage, n);
+		if (s_err != STM32_ERR_OK)
+			return s_err;
+		spage += n;
+		pages -= n;
+	}
+	return STM32_ERR_OK;
 }
 
 static stm32_err_t stm32_run_raw_code(const stm32_t *stm,
@@ -843,7 +902,7 @@ static stm32_err_t stm32_run_raw_code(const stm32_t *stm,
 				      const uint8_t *code, uint32_t code_size)
 {
 	uint32_t stack_le = le_u32(0x20002000);
-	uint32_t code_address_le = le_u32(target_address + 8);
+	uint32_t code_address_le = le_u32(target_address + 8 + 1); // thumb mode address (!)
 	uint32_t length = code_size + 8;
 	uint8_t *mem, *pos;
 	uint32_t address, w;
@@ -910,7 +969,12 @@ stm32_err_t stm32_reset_device(const stm32_t *stm)
 {
 	uint32_t target_address = stm->dev->ram_start;
 
-	return stm32_run_raw_code(stm, target_address, stm_reset_code, stm_reset_code_length);
+	if (stm->dev->flags & F_OBLL) {
+		/* set the OBL_LAUNCH bit to reset device (see RM0360, 2.5) */
+		return stm32_run_raw_code(stm, target_address, stm_obl_launch_code, stm_obl_launch_code_length);
+	} else {
+		return stm32_run_raw_code(stm, target_address, stm_reset_code, stm_reset_code_length);
+	}
 }
 
 stm32_err_t stm32_crc_memory(const stm32_t *stm, uint32_t address,
